@@ -110,7 +110,7 @@ gdal_sieve.py
 
 ---
 
-## 3. Polygonisation
+## 4. Polygonisation
 
 Conversion raster → polygones :
 
@@ -120,7 +120,7 @@ gdal_polygonize.py
 
 ---
 
-## 4. Dissolve local
+## 5. Dissolve local
 
 Fusion des polygones de même classe par dalle :
 
@@ -138,7 +138,7 @@ Correspondance des classes :
 
 ---
 
-## 5. Fusion incrémentale
+## 6. Fusion incrémentale
 
 Chaque dalle est ajoutée progressivement au fichier final :
 
@@ -197,6 +197,8 @@ LAS/LAZ
 Filtrage classes 3-5
    ↓
 Rasterisation PDAL
+   ↓
+filtrage GDAL
    ↓
 Polygonisation GDAL
    ↓
