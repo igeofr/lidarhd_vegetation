@@ -100,6 +100,16 @@ Rasterisation directe des classifications LiDAR :
 
 ---
 
+## 3. Filtrage
+
+Suppression des groupes de moins de 3 pixels ayant une connectivité de 8 voisins :
+
+```bash
+gdal_sieve.py
+```
+
+---
+
 ## 3. Polygonisation
 
 Conversion raster → polygones :
