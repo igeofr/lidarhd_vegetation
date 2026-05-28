@@ -16,6 +16,8 @@ Le traitement :
 
 Le traitement est optimisé pour des volumes importants de données LiDAR.
 
+<img width="1103" height="756" alt="image" src="https://github.com/user-attachments/assets/96e0a6bc-9ad3-4e43-981c-e91af1d16cb5" />
+
 ---
 
 # Classes conservées
