@@ -2,7 +2,7 @@
 
 ## Description
 
-Ce script permet de produire une couche vectorielle de végétation à partir de dalles LiDAR `.laz`.
+Ce projet permet de produire une couche vectorielle de végétation à partir de dalles LiDAR `.laz`.
 
 Le traitement conserve uniquement les classes de végétation :
 
@@ -19,6 +19,54 @@ Le pipeline utilise :
 Le traitement est optimisé pour manipuler plusieurs milliers de dalles LiDAR.
 
 <img width="1103" height="756" alt="image" src="https://github.com/user-attachments/assets/96e0a6bc-9ad3-4e43-981c-e91af1d16cb5" />
+
+---
+
+# Scripts disponibles
+
+## Version standard
+
+```text
+lidarhd_vegetation_vecteur.sh
+```
+
+Version séquentielle classique :
+
+* traitement dalle par dalle
+* consommation mémoire plus faible
+* plus simple à déboguer
+* adaptée aux petites/moyennes séries de dalles
+
+---
+
+## Version parallélisée
+
+```text
+lidarhd_vegetation_vecteur_parallel.sh
+```
+
+Version optimisée multi-cœurs :
+
+* traitement parallèle des dalles
+* accélération importante sur gros volumes
+* particulièrement adaptée aux SSD/NVMe
+* recommandée pour plusieurs centaines ou milliers de dalles
+
+Le pipeline par dalle est parallélisé :
+
+```text
+LAZ
+  ↓
+Rasterisation PDAL
+  ↓
+Sieve GDAL
+  ↓
+Polygonisation
+  ↓
+Dissolve local
+```
+
+La fusion finale reste séquentielle afin d’éviter les conflits d’écriture GeoPackage.
 
 ---
 
@@ -94,6 +142,33 @@ SIEVE_THRESHOLD=3
 # Dissolve global final
 ENABLE_FINAL_DISSOLVE=false
 ```
+
+---
+
+## Paramètres de parallélisation
+
+Uniquement pour :
+
+```text
+lidarhd_vegetation_vecteur_parallel.sh
+```
+
+```bash
+# Nombre de traitements parallèles
+N_JOBS=8
+```
+
+Recommandations :
+
+| CPU      | Valeur recommandée |
+| -------- | ------------------ |
+| 4 cœurs  | 4                  |
+| 8 cœurs  | 8                  |
+| 16 cœurs | 12–16              |
+
+Sur SSD/NVMe, la parallélisation apporte un gain très important.
+
+Sur disque HDD classique, le gain peut être limité par les entrées/sorties.
 
 ---
 
@@ -307,16 +382,28 @@ output_vegetation_occitanie/
 
 # Exécution
 
-## Rendre le script exécutable
+## Rendre les scripts exécutables
 
 ```bash
-chmod +x LIDAR_veg_IGN.sh
+chmod +x lidarhd_vegetation_vecteur.sh
+
+chmod +x lidarhd_vegetation_vecteur_parallel.sh
 ```
 
-## Lancer le traitement
+---
+
+## Lancer la version standard
 
 ```bash
-./LIDAR_veg_IGN.sh
+./lidarhd_vegetation_vecteur.sh
+```
+
+---
+
+## Lancer la version parallélisée
+
+```bash
+./lidarhd_vegetation_vecteur_parallel.sh
 ```
 
 ---
@@ -350,3 +437,4 @@ output_vegetation_occitanie/
 * Le dissolve local permet de limiter la complexité géométrique.
 * La fusion incrémentale est beaucoup plus rapide qu’un dissolve global à chaque dalle.
 * Le dissolve global final est optionnel afin de conserver de bonnes performances sur de gros volumes de données.
+* La version parallélisée est fortement recommandée pour les traitements massifs.
