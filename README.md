@@ -2,21 +2,45 @@
 
 ## Description
 
-Ce script permet de produire une couche vectorielle de végétation à partir de dalles LiDAR (`.laz`).
+Ce script permet de produire une couche vectorielle de végétation à partir de dalles LiDAR `.laz`.
 
-Le traitement :
+Le traitement conserve uniquement les classes de végétation :
 
-* extrait uniquement les classes de végétation LiDAR (`3`, `4`, `5`)
-* rasterise les classifications avec PDAL
-* filtre les petits objets raster isolés
-* polygonise les rasters avec GDAL
-* dissout les géométries par classe et par dalle
-* fusionne l’ensemble des dalles dans un GeoPackage unique
-* réalise un dissolve global final par classe de végétation
+* `3` → végétation basse
+* `4` → végétation moyenne
+* `5` → végétation haute
 
-Le traitement est optimisé pour des volumes importants de données LiDAR.
+Le pipeline utilise :
+
+* PDAL pour la rasterisation
+* GDAL pour le filtrage raster et la polygonisation
+* OGR/GPKG pour les traitements vectoriels
+
+Le traitement est optimisé pour manipuler plusieurs milliers de dalles LiDAR.
 
 <img width="1103" height="756" alt="image" src="https://github.com/user-attachments/assets/96e0a6bc-9ad3-4e43-981c-e91af1d16cb5" />
+
+---
+
+# Pipeline de traitement
+
+```text
+LAZ
+  ↓
+Filtrage Classification[3:5]
+  ↓
+Rasterisation PDAL
+  ↓
+Filtrage raster (sieve)
+  ↓
+Polygonisation GDAL
+  ↓
+Dissolve local par dalle
+  ↓
+Fusion incrémentale
+  ↓
+Dissolve global final (optionnel)
+```
 
 ---
 
@@ -48,7 +72,7 @@ sudo apt install gdal-bin
 
 # Configuration
 
-## Dossiers
+## Répertoires
 
 ```bash
 INPUT_DIR="/home/utilisateur/Documents/traitement_LIDAR_vegetation/data"
@@ -58,29 +82,46 @@ OUTPUT_DIR="output_vegetation_occitanie"
 
 ---
 
-# Optimisations GDAL / SQLite
+## Paramètres principaux
+
+```bash
+# Résolution raster
+RESOLUTION=0.8
+
+# Taille minimale des groupes de pixels conservés
+SIEVE_THRESHOLD=3
+
+# Dissolve global final
+ENABLE_FINAL_DISSOLVE=false
+```
+
+---
+
+## Optimisations GDAL / SQLite
 
 ```bash
 export GDAL_NUM_THREADS=ALL_CPUS
 
 export OGR_SQLITE_SYNCHRONOUS=OFF
-export OGR_SQLITE_CACHE=2048
+
+export OGR_SQLITE_CACHE=4096
+
 export OGR_SQLITE_PRAGMA="journal_mode=OFF,temp_store=MEMORY"
 ```
 
 ---
 
-# Reconstruction de l’emprise IGN
+# Reconstruction automatique des emprises IGN
 
-L’emprise de chaque dalle est reconstruite automatiquement à partir du nom de fichier.
+Le script reconstruit automatiquement l’emprise de chaque dalle à partir du nom du fichier.
 
-Exemple :
+## Exemple
 
 ```text
 0671_6296.laz
 ```
 
-Correspond à :
+devient :
 
 ```text
 xmin = 671000
@@ -89,19 +130,19 @@ xmax = 672000
 ymin = 6295000
 ```
 
-Cette emprise est utilisée pour :
+Cette emprise est utilisée directement dans `writers.gdal` afin de :
 
-* contraindre la rasterisation PDAL
 * éviter les débordements inter-dalles
+* garantir une grille raster fixe
 * limiter les superpositions de géométries
 
 ---
 
 # Étapes du traitement
 
-## 1. Extraction des classes 3 à 5
+## 1. Filtrage des classes LiDAR
 
-Filtrage des points LiDAR de végétation :
+Extraction des classifications de végétation :
 
 ```json
 {
@@ -114,7 +155,7 @@ Filtrage des points LiDAR de végétation :
 
 ## 2. Rasterisation PDAL
 
-Rasterisation directe des classifications LiDAR :
+Rasterisation des classifications LiDAR :
 
 ```json
 {
@@ -135,20 +176,11 @@ Rasterisation directe des classifications LiDAR :
 | resolution  | 0.8 m          |
 | binmode     | true           |
 
-### Fonctionnement
-
-Le mode `binmode=true` permet :
-
-* d’utiliser uniquement les points présents dans chaque pixel
-* d’éviter les interpolations
-* de produire une rasterisation plus stable
-* de limiter les artefacts inter-dalles
-
 ---
 
 ## 3. Filtrage raster
 
-Suppression des petits groupes de pixels isolés :
+Suppression des petits groupes isolés de pixels :
 
 ```bash
 gdal_sieve.py
@@ -156,16 +188,16 @@ gdal_sieve.py
 
 ### Paramètres
 
-| Paramètre    | Valeur    |
-| ------------ | --------- |
-| seuil        | 3 pixels  |
-| connectivité | 8 voisins |
+| Paramètre | Description                        |
+| --------- | ---------------------------------- |
+| `-st 3`   | suppression des groupes < 3 pixels |
+| `-8`      | connectivité 8 voisins             |
 
-### Objectifs
+Ce filtrage permet :
 
-* réduire le bruit raster
-* accélérer la polygonisation
-* réduire le nombre de géométries
+* de réduire le bruit
+* d’accélérer la polygonisation
+* de limiter fortement le nombre de géométries
 
 ---
 
@@ -181,7 +213,11 @@ gdal_polygonize.py
 
 ## 5. Dissolve local par dalle
 
-Fusion des polygones de même classe à l’échelle de chaque dalle.
+Fusion des polygones de même classe dans chaque dalle :
+
+```sql
+GROUP BY DN
+```
 
 Correspondance des classes :
 
@@ -191,82 +227,75 @@ Correspondance des classes :
 | 4  | moyenne |
 | 5  | haute   |
 
-Le dissolve produit environ :
+Le dissolve local réduit fortement le nombre de géométries :
 
 ```text
+milliers de polygones
+          ↓
 ~3 MULTIPOLYGON par dalle
 ```
 
 ---
 
-## 6. Fusion des dalles
+## 6. Fusion incrémentale
 
-Chaque dalle est ajoutée progressivement dans un GeoPackage intermédiaire :
+Les géométries de chaque dalle sont ajoutées progressivement dans :
 
 ```text
-vegetation_occitanie_dissolved.gpkg
+vegetation_occitanie.gpkg
 ```
 
-Cette étape ne réalise plus de dissolve global à chaque itération afin de :
+Cette méthode permet :
 
-* limiter fortement les temps de traitement
-* éviter les unions géométriques répétitives
-* réduire l’utilisation mémoire
+* d’éviter un dissolve global à chaque itération
+* de réduire fortement les temps de traitement
+* de gérer plusieurs milliers de dalles
 
 ---
 
-## 7. Dissolve global final
+## 7. Dissolve global final (optionnel)
 
-Un dissolve global unique est exécuté à la fin du traitement :
+Le dissolve global peut être activé via :
+
+```bash
+ENABLE_FINAL_DISSOLVE=true
+```
+
+Le traitement fusionne alors toutes les géométries par classe :
 
 ```sql
 GROUP BY classification, classe_vegetation
 ```
 
-Le dissolve final porte sur environ :
-
-```text
-6000 dalles × 3 classes
-≈ 18000 géométries
-```
-
-Cette approche est beaucoup plus performante qu’un dissolve global exécuté après chaque dalle.
-
----
-
-# Fichiers générés
-
-## Fichier intermédiaire
-
-```text
-vegetation_occitanie_dissolved.gpkg
-```
-
-Contient les géométries fusionnées par dalle.
-
----
-
-## Fichier final
+Le résultat est enregistré dans :
 
 ```text
 vegetation_occitanie_final.gpkg
 ```
 
-Contient le dissolve global final par classe de végétation.
+Ce traitement peut être long sur de très gros volumes de données.
 
 ---
 
-# Structure des sorties
+# Fichiers de sortie
+
+## Fusion incrémentale
 
 ```text
 output_vegetation_occitanie/
-├── vegetation_occitanie_dissolved.gpkg
+└── vegetation_occitanie.gpkg
+```
+
+## Dissolve global final
+
+```text
+output_vegetation_occitanie/
 └── vegetation_occitanie_final.gpkg
 ```
 
 ---
 
-# Champs attributaires
+# Structure des attributs
 
 | Champ             | Description             |
 | ----------------- | ----------------------- |
@@ -281,57 +310,33 @@ output_vegetation_occitanie/
 ## Rendre le script exécutable
 
 ```bash
-chmod +x LIDAR.sh
+chmod +x LIDAR_veg_IGN.sh
 ```
 
 ## Lancer le traitement
 
 ```bash
-./LIDAR.sh
+./LIDAR_veg_IGN.sh
 ```
 
 ---
 
-# Résumé du pipeline
-
-```text
-LAS / LAZ
-   ↓
-Filtrage classes 3-5
-   ↓
-Rasterisation PDAL
-   ↓
-Filtrage raster (sieve)
-   ↓
-Polygonisation GDAL
-   ↓
-Dissolve local par dalle
-   ↓
-Fusion des dalles
-   ↓
-Dissolve global final
-   ↓
-GeoPackage final
-```
-
----
-
-# Structure des fichiers
+# Structure des données
 
 ## Entrée
 
 ```text
 data/
-├── dalle_01.laz
-├── dalle_02.laz
-├── dalle_03.laz
+├── 0671_6296.laz
+├── 0672_6296.laz
+├── 0673_6296.laz
 ```
 
 ## Sortie
 
 ```text
 output_vegetation_occitanie/
-├── vegetation_occitanie_dissolved.gpkg
+├── vegetation_occitanie.gpkg
 └── vegetation_occitanie_final.gpkg
 ```
 
@@ -339,8 +344,9 @@ output_vegetation_occitanie/
 
 # Notes
 
-* Le traitement conserve uniquement les classifications LiDAR de végétation.
-* Les géométries finales sont stockées en `MULTIPOLYGON`.
-* Le filtrage raster réduit fortement les petits artefacts isolés.
-* L’emprise IGN permet d’éviter les superpositions inter-dalles.
-* Le dissolve global est exécuté une seule fois en fin de traitement afin d’améliorer les performances.
+* Le traitement conserve uniquement les classes LiDAR de végétation.
+* Les rasters sont bornés automatiquement aux emprises IGN.
+* Le filtrage raster réduit fortement le bruit et le nombre de géométries.
+* Le dissolve local permet de limiter la complexité géométrique.
+* La fusion incrémentale est beaucoup plus rapide qu’un dissolve global à chaque dalle.
+* Le dissolve global final est optionnel afin de conserver de bonnes performances sur de gros volumes de données.
