@@ -31,16 +31,16 @@
 #     ↓
 #   Fusion incrémentale
 #     ↓
-#   Dissolve global final
+#   Dissolve global final (optionnel)
 #
 # SORTIES
 # --------
 #
-#   vegetation_occitanie_dissolved.gpkg
-#       → accumulation des dalles
+# vegetation_occitanie.gpkg
+#     → accumulation des dalles
 #
-#   vegetation_occitanie_final.gpkg
-#       → dissolve global final
+# vegetation_occitanie_final.gpkg
+#     → dissolve global final
 #
 # ============================================================
 
@@ -56,16 +56,30 @@ OUTPUT_DIR="output_vegetation_occitanie"
 
 mkdir -p "$OUTPUT_DIR"
 
+# ------------------------------------------------------------
+# PARAMÈTRES DE TRAITEMENT
+# ------------------------------------------------------------
+
+# Résolution raster (mètre)
+RESOLUTION=0.8
+
+# Taille minimale des groupes de pixels conservés
+# (1-2 pixels supprimés)
+SIEVE_THRESHOLD=3
+
+# Dissolve global final :
+#   true  → active le dissolve global
+#   false → conserve uniquement la fusion incrémentale
+ENABLE_FINAL_DISSOLVE=false
+
 # ============================================================
 # OPTIMISATIONS GDAL / SQLITE
 # ============================================================
 
-# Utilisation de tous les CPU disponibles
 export GDAL_NUM_THREADS=ALL_CPUS
 
-# Optimisations GeoPackage / SQLite
 export OGR_SQLITE_SYNCHRONOUS=OFF
-export OGR_SQLITE_CACHE=2048
+export OGR_SQLITE_CACHE=4096
 export OGR_SQLITE_PRAGMA="journal_mode=OFF,temp_store=MEMORY"
 
 # ============================================================
@@ -80,17 +94,19 @@ DEPENDENCIES=(
 )
 
 for CMD in "${DEPENDENCIES[@]}"; do
+
     command -v "$CMD" >/dev/null 2>&1 || {
         echo "❌ Dépendance absente : $CMD"
         exit 1
     }
+
 done
 
 # ============================================================
 # FICHIERS DE SORTIE
 # ============================================================
 
-MERGED_GPKG="$OUTPUT_DIR/vegetation_occitanie_dissolved.gpkg"
+MERGED_GPKG="$OUTPUT_DIR/vegetation_occitanie.gpkg"
 
 FINAL_GPKG="$OUTPUT_DIR/vegetation_occitanie_final.gpkg"
 
@@ -111,7 +127,7 @@ shopt -s nullglob
 FILES=("$INPUT_DIR"/*.laz)
 
 if [ ${#FILES[@]} -eq 0 ]; then
-    echo "❌ Aucun fichier .laz trouvé"
+    echo "❌ Aucun fichier .laz trouvé dans : $INPUT_DIR"
     exit 1
 fi
 
@@ -143,14 +159,22 @@ for FILE in "${FILES[@]}"; do
     #
     # ========================================================
 
-    TILE_X=$(echo "$BASENAME" | grep -oE '[0-9]{4}_[0-9]{4}' | cut -d'_' -f1)
+    TILE_X=$(echo "$BASENAME" \
+        | grep -oE '[0-9]{4}_[0-9]{4}' \
+        | cut -d'_' -f1)
 
-    TILE_Y=$(echo "$BASENAME" | grep -oE '[0-9]{4}_[0-9]{4}' | cut -d'_' -f2)
+    TILE_Y=$(echo "$BASENAME" \
+        | grep -oE '[0-9]{4}_[0-9]{4}' \
+        | cut -d'_' -f2)
 
     if [ -z "$TILE_X" ] || [ -z "$TILE_Y" ]; then
-        echo "❌ Impossible de lire les coordonnées de dalle"
+        echo "❌ Impossible de lire les coordonnées IGN : $BASENAME"
         exit 1
     fi
+
+    # --------------------------------------------------------
+    # Conversion IGN
+    # --------------------------------------------------------
 
     XMIN=$((10#$TILE_X * 1000))
     YMAX=$((10#$TILE_Y * 1000))
@@ -176,14 +200,17 @@ for FILE in "${FILES[@]}"; do
     # ÉTAPE 1 — EXTRACTION + RASTERISATION
     # ========================================================
     #
-    # Filtrage des classes :
+    # Extraction des classes :
     #
-    #   3 = basse
-    #   4 = moyenne
-    #   5 = haute
+    #   3 → basse
+    #   4 → moyenne
+    #   5 → haute
     #
-    # Rasterisation bornée à l’emprise IGN
-    # pour éviter les débordements inter-dalles.
+    # Raster borné à l’emprise IGN afin de :
+    #
+    #   - éviter les débordements inter-dalles
+    #   - éviter les superpositions
+    #   - conserver une grille fixe
     #
     # ========================================================
 
@@ -206,7 +233,7 @@ for FILE in "${FILES[@]}"; do
       "filename": "$RASTER",
       "dimension": "Classification",
       "output_type": "max",
-      "resolution": 0.8,
+      "resolution": $RESOLUTION,
       "binmode": "true",
       "bounds": "([$XMIN,$XMAX],[$YMIN,$YMAX])"
     }
@@ -220,10 +247,10 @@ EOF
     pdal pipeline "$PIPELINE"
 
     # ========================================================
-    # ÉTAPE 2 — FILTRAGE DU BRUIT
+    # ÉTAPE 2 — FILTRAGE RASTER
     # ========================================================
     #
-    # Suppression des groupes isolés :
+    # Suppression des petits groupes isolés :
     #
     #   - 1 pixel
     #   - 2 pixels
@@ -239,7 +266,7 @@ EOF
     echo "🔹 Filtrage raster (sieve)..."
 
     gdal_sieve.py \
-        -st 3 \
+        -st "$SIEVE_THRESHOLD" \
         -8 \
         "$RASTER" \
         "$SIEVE_RASTER"
@@ -264,7 +291,7 @@ EOF
     #
     #   milliers de polygones
     #              ↓
-    #   ~3 géométries MULTIPOLYGON
+    #   ~3 MULTIPOLYGON par dalle
     #
     # ========================================================
 
@@ -301,7 +328,9 @@ EOF
 
         FROM polygons
 
-        WHERE DN IN (3,4,5)
+        WHERE
+            DN IN (3,4,5)
+            AND geom IS NOT NULL
 
         GROUP BY DN
         "
@@ -310,8 +339,13 @@ EOF
     # ÉTAPE 5 — FUSION INCRÉMENTALE
     # ========================================================
     #
-    # On accumule simplement les géométries
-    # sans dissolve global à chaque dalle.
+    # Accumulation simple des géométries :
+    #
+    #   - rapide
+    #   - peu coûteux
+    #   - scalable sur milliers de dalles
+    #
+    # Aucun dissolve global n’est exécuté ici.
     #
     # ========================================================
 
@@ -359,69 +393,66 @@ EOF
         "$POLYGONS" \
         "$POLYGONS_CLASS"
 
-    echo "✅ Tuile terminée"
+    echo "✅ Tuile terminée : $BASENAME"
 
 done
 
 # ============================================================
-# DISSOLVE GLOBAL FINAL
-# ============================================================
-#
-# Dissolve unique exécuté UNE SEULE FOIS.
-#
-# Charge estimée :
-#
-#   ~6000 dalles
-#   × 3 géométries
-#   ≈ 18000 géométries
-#
-# Ce volume reste gérable.
-#
+# ÉTAPE 7 — DISSOLVE GLOBAL FINAL (OPTIONNEL)
 # ============================================================
 
-echo ""
-echo "=================================================="
-echo "🔹 DISSOLVE GLOBAL FINAL"
-echo "=================================================="
+if [ "$ENABLE_FINAL_DISSOLVE" = true ]; then
 
-ogr2ogr \
-    -f GPKG \
-    "$TMP_FINAL" \
-    "$MERGED_GPKG" \
-    -nln vegetation \
-    -nlt MULTIPOLYGON \
-    -lco GEOMETRY_NAME=geom \
-    -lco SPATIAL_INDEX=YES \
-    -dialect sqlite \
-    -sql "
-    SELECT
+    echo ""
+    echo "=================================================="
+    echo "🔹 DISSOLVE GLOBAL FINAL"
+    echo "=================================================="
 
-        classification,
+    ogr2ogr \
+        -f GPKG \
+        "$TMP_FINAL" \
+        "$MERGED_GPKG" \
+        -nln vegetation \
+        -nlt MULTIPOLYGON \
+        -lco GEOMETRY_NAME=geom \
+        -lco SPATIAL_INDEX=YES \
+        -dialect sqlite \
+        -sql "
+        SELECT
 
-        classe_vegetation,
+            classification,
 
-        CastToMultiPolygon(
+            classe_vegetation,
 
-            ST_UnaryUnion(
-                ST_Collect(geom)
-            )
+            CastToMultiPolygon(
 
-        ) AS geom
+                ST_UnaryUnion(
+                    ST_Collect(geom)
+                )
 
-    FROM vegetation
+            ) AS geom
 
-    WHERE geom IS NOT NULL
+        FROM vegetation
 
-    GROUP BY
-        classification,
-        classe_vegetation
-    "
+        WHERE geom IS NOT NULL
 
-# ============================================================
-# REMPLACEMENT FINAL
-# ============================================================
+        GROUP BY
+            classification,
+            classe_vegetation
+        "
 
-mv "$TMP_FINAL" "$FINAL_GPKG"
+    mv "$TMP_FINAL" "$FINAL_GPKG"
+
+    echo "✅ Dissolve global terminé"
+
+else
+
+    echo ""
+    echo "=================================================="
+    echo "ℹ️ Dissolve global ignoré"
+    echo "=================================================="
+
+fi
 
 # ============================================================
 # FIN
