@@ -6,34 +6,41 @@
 #
 # OBJECTIF
 # --------
-# Produire une couche vectorielle de végétation à partir
+#
+# Générer une couche vectorielle de végétation à partir
 # de dalles LiDAR (.laz) en conservant uniquement :
 #
-#   3 = végétation basse
-#   4 = végétation moyenne
-#   5 = végétation haute
+#   3 → végétation basse
+#   4 → végétation moyenne
+#   5 → végétation haute
 #
 # PIPELINE
 # --------
 #
 #   LAZ
-#    ↓
-#   filtre Classification[3:5]
-#    ↓
-#   rasterisation PDAL
-#    ↓
-#   filtrage
-#    ↓
-#   polygonisation GDAL
-#    ↓
-#   dissolve local par dalle
-#    ↓
-#   fusion incrémentale globale
+#     ↓
+#   Filtrage Classification[3:5]
+#     ↓
+#   Rasterisation PDAL
+#     ↓
+#   Filtrage raster (sieve)
+#     ↓
+#   Polygonisation GDAL
+#     ↓
+#   Dissolve local par dalle
+#     ↓
+#   Fusion incrémentale
+#     ↓
+#   Dissolve global final
 #
-# SORTIE
-# -------
+# SORTIES
+# --------
 #
 #   vegetation_occitanie_dissolved.gpkg
+#       → accumulation des dalles
+#
+#   vegetation_occitanie_final.gpkg
+#       → dissolve global final
 #
 # ============================================================
 
@@ -50,49 +57,53 @@ OUTPUT_DIR="output_vegetation_occitanie"
 mkdir -p "$OUTPUT_DIR"
 
 # ============================================================
-# VÉRIFICATION DES DÉPENDANCES
-# ============================================================
-
-command -v pdal >/dev/null 2>&1 || {
-    echo "❌ PDAL non installé"
-    exit 1
-}
-
-command -v ogr2ogr >/dev/null 2>&1 || {
-    echo "❌ GDAL/OGR non installé"
-    exit 1
-}
-
-command -v gdal_polygonize.py >/dev/null 2>&1 || {
-    echo "❌ gdal_polygonize.py absent"
-    exit 1
-}
-
-command -v gdal_sieve.py >/dev/null 2>&1 || {
-    echo "❌ gdal_sieve.py absent"
-    exit 1
-}
-
-# ============================================================
 # OPTIMISATIONS GDAL / SQLITE
 # ============================================================
 
+# Utilisation de tous les CPU disponibles
 export GDAL_NUM_THREADS=ALL_CPUS
 
+# Optimisations GeoPackage / SQLite
 export OGR_SQLITE_SYNCHRONOUS=OFF
 export OGR_SQLITE_CACHE=2048
 export OGR_SQLITE_PRAGMA="journal_mode=OFF,temp_store=MEMORY"
 
 # ============================================================
-# FICHIER FINAL
+# VÉRIFICATION DES DÉPENDANCES
 # ============================================================
 
-DISSOLVED_GPKG="$OUTPUT_DIR/vegetation_occitanie_dissolved.gpkg"
+DEPENDENCIES=(
+    pdal
+    ogr2ogr
+    gdal_polygonize.py
+    gdal_sieve.py
+)
 
-rm -f "$DISSOLVED_GPKG"
+for CMD in "${DEPENDENCIES[@]}"; do
+    command -v "$CMD" >/dev/null 2>&1 || {
+        echo "❌ Dépendance absente : $CMD"
+        exit 1
+    }
+done
 
 # ============================================================
-# GESTION DU CAS "AUCUN FICHIER"
+# FICHIERS DE SORTIE
+# ============================================================
+
+MERGED_GPKG="$OUTPUT_DIR/vegetation_occitanie_dissolved.gpkg"
+
+FINAL_GPKG="$OUTPUT_DIR/vegetation_occitanie_final.gpkg"
+
+TMP_FINAL="$OUTPUT_DIR/tmp_final.gpkg"
+
+# Nettoyage anciennes versions
+rm -f \
+    "$MERGED_GPKG" \
+    "$FINAL_GPKG" \
+    "$TMP_FINAL"
+
+# ============================================================
+# VÉRIFICATION DES DONNÉES
 # ============================================================
 
 shopt -s nullglob
@@ -100,7 +111,7 @@ shopt -s nullglob
 FILES=("$INPUT_DIR"/*.laz)
 
 if [ ${#FILES[@]} -eq 0 ]; then
-    echo "❌ Aucun fichier .laz trouvé dans : $INPUT_DIR"
+    echo "❌ Aucun fichier .laz trouvé"
     exit 1
 fi
 
@@ -118,7 +129,7 @@ for FILE in "${FILES[@]}"; do
     echo "=================================================="
 
     # ========================================================
-    # RECONSTRUCTION EMPRISE 1 KM
+    # RECONSTRUCTION DE L’EMPRISE IGN
     # ========================================================
     #
     # Exemple :
@@ -128,7 +139,7 @@ for FILE in "${FILES[@]}"; do
     # devient :
     #
     #   xmin = 671000
-    #   ymin = 6296000
+    #   ymax = 6296000
     #
     # ========================================================
 
@@ -137,12 +148,13 @@ for FILE in "${FILES[@]}"; do
     TILE_Y=$(echo "$BASENAME" | grep -oE '[0-9]{4}_[0-9]{4}' | cut -d'_' -f2)
 
     if [ -z "$TILE_X" ] || [ -z "$TILE_Y" ]; then
-        echo "❌ Impossible de lire les coordonnées : $BASENAME"
+        echo "❌ Impossible de lire les coordonnées de dalle"
         exit 1
     fi
 
     XMIN=$((10#$TILE_X * 1000))
     YMAX=$((10#$TILE_Y * 1000))
+
     XMAX=$((XMIN + 1000))
     YMIN=$((YMAX - 1000))
 
@@ -154,27 +166,24 @@ for FILE in "${FILES[@]}"; do
 
     RASTER="$OUTPUT_DIR/${BASENAME}_classification.tif"
 
+    SIEVE_RASTER="$OUTPUT_DIR/${BASENAME}_classification_sieved.tif"
+
     POLYGONS="$OUTPUT_DIR/${BASENAME}_polygons.gpkg"
 
     POLYGONS_CLASS="$OUTPUT_DIR/${BASENAME}_polygons_classified.gpkg"
 
-    TMP_DISSOLVE="$OUTPUT_DIR/tmp_dissolve.gpkg"
-
-    SIEVE_RASTER="$OUTPUT_DIR/${BASENAME}_classification_sieved.tif"
-
     # ========================================================
-    # ÉTAPE 1
-    # EXTRACTION + RASTERISATION
+    # ÉTAPE 1 — EXTRACTION + RASTERISATION
     # ========================================================
     #
-    # Extraction des classes :
+    # Filtrage des classes :
     #
     #   3 = basse
     #   4 = moyenne
     #   5 = haute
     #
-    # Raster directement borné à l’emprise IGN
-    # pour éviter tout débordement inter-dalles.
+    # Rasterisation bornée à l’emprise IGN
+    # pour éviter les débordements inter-dalles.
     #
     # ========================================================
 
@@ -197,7 +206,7 @@ for FILE in "${FILES[@]}"; do
       "filename": "$RASTER",
       "dimension": "Classification",
       "output_type": "max",
-      "resolution": 0.5,
+      "resolution": 0.8,
       "binmode": "true",
       "bounds": "([$XMIN,$XMAX],[$YMIN,$YMAX])"
     }
@@ -211,8 +220,7 @@ EOF
     pdal pipeline "$PIPELINE"
 
     # ========================================================
-    # ÉTAPE 2
-    # FILTRAGE DES PETITES ENTITÉS
+    # ÉTAPE 2 — FILTRAGE DU BRUIT
     # ========================================================
     #
     # Suppression des groupes isolés :
@@ -220,11 +228,11 @@ EOF
     #   - 1 pixel
     #   - 2 pixels
     #
-    # Permet de :
+    # Réduit fortement :
     #
-    #   - réduire le bruit
-    #   - accélérer la polygonisation
-    #   - réduire fortement le nombre de géométries
+    #   - le bruit
+    #   - le nombre de polygones
+    #   - le temps de dissolve
     #
     # ========================================================
 
@@ -237,8 +245,7 @@ EOF
         "$SIEVE_RASTER"
 
     # ========================================================
-    # ÉTAPE 3
-    # POLYGONISATION
+    # ÉTAPE 3 — POLYGONISATION
     # ========================================================
 
     echo "🔹 Polygonisation..."
@@ -250,15 +257,14 @@ EOF
         polygons
 
     # ========================================================
-    # ÉTAPE 4
-    # DISSOLVE LOCAL PAR DALLE
+    # ÉTAPE 4 — DISSOLVE LOCAL
     # ========================================================
     #
     # Réduction drastique :
     #
-    # milliers de polygones
-    #            ↓
-    # ~3 MULTIPOLYGON par dalle
+    #   milliers de polygones
+    #              ↓
+    #   ~3 géométries MULTIPOLYGON
     #
     # ========================================================
 
@@ -275,148 +281,73 @@ EOF
         -dialect sqlite \
         -clipsrc "$XMIN" "$YMIN" "$XMAX" "$YMAX" \
         -sql "
-        WITH dissolved AS (
+        SELECT
 
-            SELECT
+            DN AS classification,
 
-                DN AS classification,
+            CASE
+                WHEN DN = 3 THEN 'basse'
+                WHEN DN = 4 THEN 'moyenne'
+                WHEN DN = 5 THEN 'haute'
+            END AS classe_vegetation,
 
-                CASE
-                    WHEN DN = 3 THEN 'basse'
-                    WHEN DN = 4 THEN 'moyenne'
-                    WHEN DN = 5 THEN 'haute'
-                END AS classe_vegetation,
+            CastToMultiPolygon(
 
-                ST_Multi(
+                ST_UnaryUnion(
+                    ST_Collect(geom)
+                )
 
-                    ST_CollectionExtract(
+            ) AS geom
 
-                        ST_MakeValid(
+        FROM polygons
 
-                            ST_UnaryUnion(
-                                ST_Collect(geom)
-                            )
+        WHERE DN IN (3,4,5)
 
-                        ),
-
-                        3
-
-                    )
-
-                ) AS geom
-
-            FROM polygons
-
-            WHERE
-                DN IN (3,4,5)
-                AND geom IS NOT NULL
-
-            GROUP BY DN
-
-        )
-
-        SELECT *
-
-        FROM dissolved
-
-        WHERE
-            geom IS NOT NULL
-            AND GeometryType(geom) IN (
-                'POLYGON',
-                'MULTIPOLYGON'
-            )
+        GROUP BY DN
         "
 
     # ========================================================
-    # ÉTAPE 5
-    # FUSION INCRÉMENTALE GLOBALE
+    # ÉTAPE 5 — FUSION INCRÉMENTALE
+    # ========================================================
+    #
+    # On accumule simplement les géométries
+    # sans dissolve global à chaque dalle.
+    #
     # ========================================================
 
     echo "🔹 Fusion incrémentale..."
 
     # --------------------------------------------------------
-    # PREMIÈRE DALLE
+    # Première dalle
     # --------------------------------------------------------
 
-    if [ ! -f "$DISSOLVED_GPKG" ]; then
+    if [ ! -f "$MERGED_GPKG" ]; then
 
-        echo "🔹 Initialisation couche finale..."
+        echo "🔹 Initialisation couche globale..."
 
-        cp "$POLYGONS_CLASS" "$DISSOLVED_GPKG"
+        cp "$POLYGONS_CLASS" "$MERGED_GPKG"
 
     # --------------------------------------------------------
-    # DALLES SUIVANTES
+    # Dalles suivantes
     # --------------------------------------------------------
 
     else
 
-        rm -f "$TMP_DISSOLVE"
+        echo "🔹 Append des géométries..."
 
-        # ----------------------------------------------------
-        # Append des nouvelles géométries
-        # ----------------------------------------------------
-        echo '🔹 Append des nouvelles géométries'
         ogr2ogr \
             -f GPKG \
             -update \
             -append \
-            "$DISSOLVED_GPKG" \
+            "$MERGED_GPKG" \
             "$POLYGONS_CLASS" \
             -nln vegetation \
-            -nlt MULTIPOLYGON \
-            -lco GEOMETRY_NAME=geom \
-            -lco SPATIAL_INDEX=YES
-
-        # ----------------------------------------------------
-        # Mini dissolve global
-        # ----------------------------------------------------
-        echo '🔹 Mini dissolve global'
-        ogr2ogr \
-            -f GPKG \
-            "$TMP_DISSOLVE" \
-            "$DISSOLVED_GPKG" \
-            -nln vegetation \
-            -nlt MULTIPOLYGON \
-            -lco GEOMETRY_NAME=geom \
-            -lco SPATIAL_INDEX=YES \
-            -dialect sqlite \
-            -sql "
-            SELECT
-                classification,
-                classe_vegetation,
-                ST_Multi(
-
-                    ST_CollectionExtract(
-
-                        ST_MakeValid(
-
-                            ST_UnaryUnion(
-                                ST_Collect(geom)
-                            )
-
-                        ),
-
-                        3
-
-                    )
-
-                ) AS geom
-            FROM vegetation
-            WHERE geom IS NOT NULL
-            GROUP BY classification, classe_vegetation
-            "
-
-        # ----------------------------------------------------
-        # Remplacement résultat final
-        # ----------------------------------------------------
-
-        mv "$TMP_DISSOLVE" "$DISSOLVED_GPKG"
+            -nlt MULTIPOLYGON
 
     fi
 
     # ========================================================
-    # ÉTAPE 6
-    # NETTOYAGE
+    # ÉTAPE 6 — NETTOYAGE
     # ========================================================
 
     echo "🔹 Nettoyage..."
@@ -424,12 +355,73 @@ EOF
     rm -f \
         "$PIPELINE" \
         "$RASTER" \
+        "$SIEVE_RASTER" \
         "$POLYGONS" \
-        "$SIEVE_RASTER"
+        "$POLYGONS_CLASS"
 
-    echo "✅ Tuile terminée : $BASENAME"
+    echo "✅ Tuile terminée"
 
 done
+
+# ============================================================
+# DISSOLVE GLOBAL FINAL
+# ============================================================
+#
+# Dissolve unique exécuté UNE SEULE FOIS.
+#
+# Charge estimée :
+#
+#   ~6000 dalles
+#   × 3 géométries
+#   ≈ 18000 géométries
+#
+# Ce volume reste gérable.
+#
+# ============================================================
+
+echo ""
+echo "=================================================="
+echo "🔹 DISSOLVE GLOBAL FINAL"
+echo "=================================================="
+
+ogr2ogr \
+    -f GPKG \
+    "$TMP_FINAL" \
+    "$MERGED_GPKG" \
+    -nln vegetation \
+    -nlt MULTIPOLYGON \
+    -lco GEOMETRY_NAME=geom \
+    -lco SPATIAL_INDEX=YES \
+    -dialect sqlite \
+    -sql "
+    SELECT
+
+        classification,
+
+        classe_vegetation,
+
+        CastToMultiPolygon(
+
+            ST_UnaryUnion(
+                ST_Collect(geom)
+            )
+
+        ) AS geom
+
+    FROM vegetation
+
+    WHERE geom IS NOT NULL
+
+    GROUP BY
+        classification,
+        classe_vegetation
+    "
+
+# ============================================================
+# REMPLACEMENT FINAL
+# ============================================================
+
+mv "$TMP_FINAL" "$FINAL_GPKG"
 
 # ============================================================
 # FIN
