@@ -255,7 +255,7 @@ EOF
         -clipsrc "$XMIN" "$YMIN" "$XMAX" "$YMAX" \
         -sql "
         SELECT
-
+            '$BASENAME' AS dalle,
             DN AS classification,
 
             CASE
